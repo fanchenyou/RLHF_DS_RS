@@ -136,3 +136,187 @@ def bivariate_loss(V_pred, V_trgt):
     result = torch.mean(result)
 
     return result
+
+
+def intimacy_politeness_score(pred_pair_xy, true_pair_xy, social_dist, hinge_ratio=0.25):
+    # assert pred_pair_xy.ndim == true_pair_xy.ndim == 4
+    # assert pred_pair_xy.size(-1) == true_pair_xy.size(-1) == 2
+    # print(pred_pair_xy.size(), true_pair_xy.size())
+    pred_pair_dist = torch.sqrt(torch.sum(pred_pair_xy ** 2, dim=-1))
+    true_pair_dist = torch.sqrt(torch.sum(true_pair_xy ** 2, dim=-1))
+
+    # assume pred_pair is [12, N_obj, N_obj]
+    # if avg dist is less than 1SD
+    # we think of them as of one same group
+    # otherwise think of them as of different groups
+    # print(social_dist)
+
+    true_pair_avg_dist = torch.mean(true_pair_dist, dim=0, keepdim=True)
+
+    # hinge loss of intimacy
+    # find out the moments these grouped agents are less than 1SD
+    intimacy_score_2 = 0
+    same_group_mask = (torch.logical_and(true_pair_avg_dist > 0, true_pair_avg_dist <= 1.0 * social_dist)). \
+        repeat(pred_pair_dist.size(0), 1, 1)
+    same_group_intimate_mask = true_pair_dist[same_group_mask] <= 1.0 * social_dist
+    true_pair_dist_masked = true_pair_dist[same_group_mask][same_group_intimate_mask]
+    pred_pair_dist_masked = pred_pair_dist[same_group_mask][same_group_intimate_mask]
+    # score is 1 from 0~true_d, then goes down to 0 at 1.25*true_d
+    if true_pair_dist_masked.size(0) > 0:
+        if 1 == 2:
+            for pred_val, true_val in zip(pred_pair_dist_masked, true_pair_dist_masked):
+                sc = 0
+                if pred_val <= true_val:
+                    sc = 1.0  # reward is 1
+                else:
+                    sc = ((1 + hinge_ratio) * true_val - pred_val) / (hinge_ratio * true_val)
+                    sc = sc.item()
+                    if sc < 0:
+                        sc = 0
+                    assert 0 <= sc <= 1.0
+                intimacy_score += sc
+            intimacy_score /= true_pair_dist_masked.size(0)
+
+        intimacy_score_all = ((1 + hinge_ratio) * true_pair_dist_masked - pred_pair_dist_masked) / (
+                hinge_ratio * true_pair_dist_masked)
+        intimacy_score_all = torch.clamp(intimacy_score_all, min=0, max=1)
+        intimacy_score_2 = torch.mean(intimacy_score_all).item()
+        # print(intimacy_score_2, intimacy_score)
+
+    # hinge loss of intimacy
+    # find out the moments these grouped agents are less than 1SD
+    politeness_score_2 = 0
+    diff_group_mask = (true_pair_avg_dist > 1.0 * social_dist).repeat(pred_pair_dist.size(0), 1, 1)
+    diff_group_politeness_mask = true_pair_dist[diff_group_mask] > 1.0 * social_dist
+    true_pair_dist_masked = true_pair_dist[diff_group_mask][diff_group_politeness_mask]
+    pred_pair_dist_masked = pred_pair_dist[diff_group_mask][diff_group_politeness_mask]
+    # score is 1 from 0~true_d, then goes down to 0 at 1.25*true_d
+    if true_pair_dist_masked.size(0) > 0:
+        if 1 == 2:
+            for pred_val, true_val in zip(pred_pair_dist_masked, true_pair_dist_masked):
+                sc = 0
+                if pred_val >= true_val:
+                    sc = 1.0  # cost is 1
+                else:
+                    sc = (pred_val - (1 - hinge_ratio) * true_val) / (hinge_ratio * true_val)
+                    sc = sc.item()
+                    if sc < 0:
+                        sc = 0
+                    assert 0 <= sc <= 1.0
+                politeness_score += sc
+            politeness_score /= true_pair_dist_masked.size(0)
+
+        politeness_score_all = (pred_pair_dist_masked - (1 - hinge_ratio) * true_pair_dist_masked) / (
+                hinge_ratio * true_pair_dist_masked)
+        politeness_score_all = torch.clamp(politeness_score_all, min=0, max=1)
+        politeness_score_2 = torch.mean(politeness_score_all).item()
+        # print(politeness_score_2, politeness_score)
+
+    return intimacy_score_2, politeness_score_2
+
+
+def intimacy_politeness_score_per_step_OLD(pred_pair_xy, true_pair_xy, social_dist, hinge_ratio=0.25):
+    # assert pred_pair_xy.ndim == true_pair_xy.ndim == 4
+    # assert pred_pair_xy.size(-1) == true_pair_xy.size(-1) == 2
+    # print(pred_pair_xy.size(), true_pair_xy.size())
+    pred_pair_dist = torch.sqrt(torch.sum(pred_pair_xy ** 2, dim=-1))
+    true_pair_dist = torch.sqrt(torch.sum(true_pair_xy ** 2, dim=-1))
+
+    # assume pred_pair is [12, N_obj, N_obj]
+    # if avg dist is less than 1SD
+    # we think of them as of one same group
+    # otherwise think of them as of different groups
+
+    T, n_obj = true_pair_dist.size(0), true_pair_dist.size(1)
+    true_pair_avg_dist = torch.mean(true_pair_dist, dim=0, keepdim=False)
+
+    scores = torch.zeros(pred_pair_dist.size(0), pred_pair_dist.size(1),
+                         device=pred_pair_dist.device)
+
+    intimacy_score_all = ((1 + hinge_ratio) * true_pair_dist - pred_pair_dist) / (
+            hinge_ratio * true_pair_dist)
+    intimacy_score_all = torch.clamp(intimacy_score_all, min=0, max=1)
+
+    politeness_score_all = (pred_pair_dist - (1 - hinge_ratio) * true_pair_dist) / (
+            hinge_ratio * true_pair_dist)
+    politeness_score_all = torch.clamp(politeness_score_all, min=0, max=1)
+
+    for i in range(n_obj):
+        for j in range(i + 1, n_obj):
+            if true_pair_avg_dist[i, j] <= 1.0 * social_dist:
+                # same group
+                for t in range(T):
+                    if true_pair_dist[t, i, j] <= 1.0 * social_dist:
+                        # assert intimacy_score_all[t, i, j]==intimacy_score_all[t, j, i]
+                        scores[t, i] += intimacy_score_all[t, i, j]
+                        scores[t, j] += intimacy_score_all[t, j, i]
+            else:
+                for t in range(T):
+                    if true_pair_dist[t, i, j] > 1.0 * social_dist:
+                        # assert politeness_score_all[t, i, j]==politeness_score_all[t, j, i]
+                        scores[t, i] += politeness_score_all[t, i, j]
+                        scores[t, j] += politeness_score_all[t, j, i]
+
+    return scores
+
+
+def intimacy_politeness_score_per_step(pred_pair_xy, true_pair_xy, social_dist, hinge_ratio=0.25):
+    # assert pred_pair_xy.ndim == true_pair_xy.ndim == 4
+    # assert pred_pair_xy.size(-1) == true_pair_xy.size(-1) == 2
+    # print(pred_pair_xy.size(), true_pair_xy.size())
+    # hinge_ratio = 0.0
+    pred_pair_dist = torch.sqrt(torch.sum(pred_pair_xy ** 2, dim=-1))
+    true_pair_dist = torch.sqrt(torch.sum(true_pair_xy ** 2, dim=-1))
+    # print(social_dist)
+
+    # assume pred_pair is [12, N_obj, N_obj]
+    # if avg dist is less than 1SD
+    # we think of them as of one same group
+    # otherwise think of them as of different groups
+
+    T, n_obj = true_pair_dist.size(0), true_pair_dist.size(1)
+    true_pair_avg_dist = torch.mean(true_pair_dist, dim=0, keepdim=False)
+
+    scores = torch.zeros(pred_pair_dist.size(0), pred_pair_dist.size(1),
+                         device=pred_pair_dist.device)
+
+    intimacy_score_all = ((1 + hinge_ratio) * true_pair_dist - pred_pair_dist) / (hinge_ratio * true_pair_dist + 1e-5)
+    intimacy_score_all = torch.clamp(intimacy_score_all, min=0, max=1)
+
+    politeness_score_all = (pred_pair_dist - (1 - hinge_ratio) * true_pair_dist) / (hinge_ratio * true_pair_dist + 1e-5)
+    politeness_score_all = torch.clamp(politeness_score_all, min=0, max=1)
+
+    counter = torch.zeros_like(scores)
+
+    for i in range(n_obj):
+        for j in range(i + 1, n_obj):
+            if true_pair_avg_dist[i, j] <= 1.0 * social_dist:
+                # same group
+                for t in range(T):
+                    if true_pair_dist[t, i, j] <= 1.0 * social_dist:
+                        # assert intimacy_score_all[t, i, j]==intimacy_score_all[t, j, i]
+                        # if pred_pair_dist[t, i, j] > 1.0 * social_dist:
+                        #     assert intimacy_score_all[t, i, j] < 0
+                        scores[t, i] += intimacy_score_all[t, i, j]
+                        scores[t, j] += intimacy_score_all[t, j, i]
+                        counter[t, i] += 1
+                        counter[t, j] += 1
+
+            else:
+                for t in range(T):
+                    if true_pair_dist[t, i, j] > 1.0 * social_dist:
+                        # assert politeness_score_all[t, i, j]==politeness_score_all[t, j, i]
+                        if pred_pair_dist[t, i, j] < 1.0 * social_dist:
+                            # print(politeness_score_all[t, i, j],'00000=====')
+                            # assert politeness_score_all[t, i, j] < 0
+                            scores[t, i] += politeness_score_all[t, i, j]
+                            scores[t, j] += politeness_score_all[t, j, i]
+                        else:
+                            scores[t, i] += min(2e-1, politeness_score_all[t, i, j])
+                            scores[t, j] += min(2e-1, politeness_score_all[t, j, i])
+                        counter[t, i] += 1
+                        counter[t, j] += 1
+    scores /= (counter+1e-5)
+    # print(scores)
+
+    return scores

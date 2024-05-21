@@ -10,12 +10,12 @@ from diffusion_models.config import Config
 
 import setproctitle
 from trl import PPOConfig
+from trl.core import average_torch_dicts
 from trl.ppo_base import PPOTrainer
 from torch.utils.tensorboard import SummaryWriter
 from collections import namedtuple
 from tools.metrics import *
 from tools.loss import l2loss_new
-
 
 NUM_Tau = 5
 
@@ -134,7 +134,7 @@ class Trainer:
 
             if not init_model:
                 # load pretrained models
-                pre_diffusion_path = os.path.join('model_save', 'pre_%s/val_best.pth' % (dset,))
+                pre_diffusion_path = os.path.join('BEST_DIFF_SAVES', 'pre_%s/val_best.pth' % (dset,))
                 model_cp = torch.load(pre_diffusion_path, map_location='cpu')
                 self.model.load_state_dict(model_cp['diffusion_model_dict'])
                 print('Load pre_diffusion %s' % (pre_diffusion_path,))
@@ -182,7 +182,7 @@ class Trainer:
                 model_cp = torch.load(model_path, map_location='cpu')
                 print('pretrain from %s' % (model_path,))
                 self.model.load_state_dict(model_cp['diffusion_model_dict'])
-        elif self.mode == 'test':
+        elif self.mode == 'test' or self.mode.startswith('test_vis'):
 
             assert model_path is not None, 'not given a trained model'
             self.model_initializer = InitializationModel(t_obs=self.hist_len, s=self.fut_len * 2, n=20).to(device)
@@ -193,7 +193,12 @@ class Trainer:
             self.model_initializer.load_state_dict(model_cp['model_initializer_dict'], strict=False)
             print('Load model %s' % (model_path,))
         else:
-            assert 1==2
+            assert self.mode == 'test_sgcn' or self.mode.startswith('test_sgcn')
+            # load only diffusion model, initializer not used
+            pre_diffusion_path = os.path.join('BEST_DIFF_SAVES', 'pre_%s/val_best.pth' % (dset,))
+            model_cp = torch.load(pre_diffusion_path, map_location='cpu')
+            self.model.load_state_dict(model_cp['diffusion_model_dict'])
+            print('Load pre_diffusion %s' % (pre_diffusion_path,))
 
     def print_model_param(self, model: nn.Module, name: str = 'Model') -> None:
         '''
@@ -301,6 +306,60 @@ class Trainer:
 
         # [N_pred, 20]
         return l_all.mean(1).mean(-1)
+
+    def noise_estimation_loss_vis_traj(self, x, y_0, mask, sample_interval=3, use_average=True):
+
+        batch_size = x.shape[0]
+        # T is sampled denoising steps from 100 steps, so 100//3 = 34
+        ts = torch.arange(0, self.n_steps, sample_interval).to(x.device)
+        n_sample = 1
+
+        # print(x.size(), y_0.size())
+
+        ts = ts.unsqueeze(0).repeat(batch_size, 1)
+        # print(x.size(),y_0.size())
+
+        ys, betas, xs, es, ms = [], [], [], [], []
+        for n in range(n_sample):
+            t = ts[:, n]
+            a = self.extract(self.alphas_bar_sqrt, t, y_0)
+            beta = self.extract(self.betas, t, y_0)
+            betas.append(beta)
+            # eps multiplier
+            am1 = self.extract(self.one_minus_alphas_bar_sqrt, t, y_0)
+            e = torch.randn_like(y_0)
+            # model input
+            y = y_0 * a + e * am1
+            ys.append(y)
+            es.append(e)
+            ms.append(mask)
+            # print(mask.size())
+
+        # print(len(ys))
+        ys = torch.cat(ys, dim=0)
+        betas = torch.cat(betas, dim=0)
+        es = torch.cat(es, dim=0)
+        ms = torch.block_diag(*ms)
+        # print(ms)
+
+        with torch.no_grad():
+            output = self.model(ys, betas, x.repeat(n_sample, 1, 1), ms)
+
+        # print(n_sample, output.size())
+        return output
+
+        # l_all = (es - output).square()  # .mean().item()
+
+        # if use_average:
+        #     # scalar score for the entire scene
+        #     return l_all.mean().item(), l_all[:, -1, :].mean().item()
+
+        # # # [N_pred, N_sample=34, T_fut=20, xy=2]
+        # l_all = l_all.view(mask.size(0), n_sample, ys.size(1), ys.size(2))
+
+        # # [N_pred, 20]
+        # return l_all.mean(1).mean(-1)
+
 
     def noise_estimation_loss_score_vis(self, x, y_0, mask, sample_interval=3, use_average=True):
 
@@ -486,6 +545,11 @@ class Trainer:
 
         # self.writer = SummaryWriter(log_dir=self.cfg.model_dir)
         self.global_iter_count = 0
+
+        print('---')
+        #print(self.model_initializer)
+        print(self.model)
+        #exit()
 
         # Training loop
         for epoch in range(0, 199):
@@ -703,6 +767,47 @@ class Trainer:
 
         return nodes_.squeeze()
 
+    def get_ipscore(self, obs_traj, V_tr, generate_xy):
+        # get energy
+        # [12, N] -> [12, N, N]
+        # future gt distance
+        # hist abs trajectory
+        # print(obs_traj.size(), V_tr.size(), V_pred.size(),'---')
+        # torch.Size([12, 2, 2]) torch.Size([12, 2, 5])
+        V_x = seq_to_nodes(obs_traj.data.cpu().numpy().copy())
+        # print(V_x.shape,'----1', obs_traj.size(), V_tr.size(), generate_xy.size())
+
+        # V_x_rel_to_abs = nodes_rel_to_nodes_abs(V_obs[:, :, :, :2].data.cpu().numpy().squeeze().copy(),
+        #                                         V_x[0, :, :].copy())
+        V_y_rel_to_abs = nodes_rel_to_nodes_abs(V_tr.data.cpu().numpy().squeeze().copy(),
+                                                V_x[-1, :, :].copy())
+        V_y_rel_to_abs_tensor = torch.from_numpy(V_y_rel_to_abs).to(obs_traj.device)
+
+        # pred_xy = V_pred[:, :, 0:2]  # 【12, N, 2], only need X, Y
+        # pred_xy = [N_obj=35, N_sample=20, fut_len=12, (x,y)=2] -> [N_sample, fut_len, N_obj, 2]
+        pred_xy = generate_xy.permute(1, 2, 0, 3).data.cpu().numpy().squeeze().copy()
+        V_pred_rel_to_abs = self.nodes_sample_rel_to_nodes_abs(pred_xy, V_x[-1, :, :].copy())
+
+        # [N_sample, 12, N, 2=xy]
+        V_pred_rel_to_abs_tensor = torch.from_numpy(V_pred_rel_to_abs).to(obs_traj.device)
+        V_gt_abs_diff = V_y_rel_to_abs_tensor.unsqueeze(2) - V_y_rel_to_abs_tensor.unsqueeze(1)
+
+        V_pred_abs_diff_all = V_pred_rel_to_abs_tensor.unsqueeze(2 + 1) - V_pred_rel_to_abs_tensor.unsqueeze(1 + 1)
+
+        scores_all = []
+        for n_sample in range(V_pred_rel_to_abs_tensor.size(0)):
+            # [12, N, N, 2]
+            V_pred_abs_diff = V_pred_abs_diff_all[n_sample, ...]
+            # [12, N]
+            scores = intimacy_politeness_score_per_step(V_pred_abs_diff, V_gt_abs_diff,
+                                                        self.social_dist_sigma, hinge_ratio=0.25)
+            scores_all.append(scores)
+            # print(scores.mean(), '--')
+
+        # [N_sample, 12, N]
+        scores_all = torch.stack(scores_all, dim=0)
+
+        return scores_all
 
     # use Diffusion as Score
     def get_score(self, past_traj, fut_traj, pred_traj, traj_mask):
@@ -727,6 +832,24 @@ class Trainer:
         # print(noise_loss_diff, noise_loss_diff.size())
 
         return noise_loss_diff
+
+    def get_score_vis_traj(self, past_traj, fut_traj, pred_traj, traj_mask):
+
+        noise_gt_traj = self.noise_estimation_loss_vis_traj(past_traj, fut_traj, traj_mask, use_average=False)
+        # print(noise_gt_traj.size())
+        # print(past_traj.size(), fut_traj.size(), pred_traj.size())
+        noise_preds = []
+        for ns in range(pred_traj.size(1)):
+            noise_pred_traj = self.noise_estimation_loss_vis_traj(past_traj, pred_traj[:, ns, ...],
+                                                                 traj_mask, use_average=False)
+            noise_preds.append(noise_pred_traj)
+
+        # [N_sample, N_ped, T_fut]
+        noise_preds_traj = torch.stack(noise_preds, dim=0)
+
+
+        return noise_gt_traj, noise_preds_traj
+
 
     def get_logprobs(self, sample_prediction, mean_estimation, variance_estimation):
 
@@ -842,8 +965,14 @@ class Trainer:
                 # [35, 20, 12, 2] , [1, 35, 2, 8] , [12, 35, 2])
                 # print(generated_y.size(),'---',obs_traj.size(), '===', V_tr.size())
 
-                # use diffusion score
-                scores = self.get_score(past_traj, fut_traj, pred_traj, traj_mask)
+                if self.use_ip_rl:
+                    # use ip_score
+                    scores = self.get_ipscore(obs_traj, V_tr, pred_traj)
+                    # assert scores.size(0) == N_sample and scores.size(1) == self.fut_len and scores.size(2) == N_obj
+                    scores = scores.permute(0, 2, 1)
+                else:
+                    # use diffusion score
+                    scores = self.get_score(past_traj, fut_traj, pred_traj, traj_mask)
 
                 # [N_sample, N_obj, fut_len]
                 rewards, _ = self.ppo_trainer.compute_rewards(scores, pred_logprobs, ref_logprobs)
@@ -947,6 +1076,40 @@ class Trainer:
                     num_minus_kl_div += 1
 
                 train_loss /= mini_batch_size
+
+                if 1 == 2:
+                    mean_entropy = (-all_logprobs).sum(0).mean()
+                    writer.add_scalar('train/loss_total',
+                                      train_loss[0], self.global_iter_count)
+                    writer.add_scalar('train/ppo_p',
+                                      train_loss[1], self.global_iter_count)
+                    writer.add_scalar('train/ppo_v',
+                                      train_loss[2], self.global_iter_count)
+                    writer.add_scalar('train/loss_dist',
+                                      train_loss[3], self.global_iter_count)
+                    writer.add_scalar('train/loss_uncertain',
+                                      train_loss[4], self.global_iter_count)
+                    writer.add_scalar('train/loss_l2_reg',
+                                      train_loss[5], self.global_iter_count)
+                    writer.add_scalar('train/learning_rate',
+                                      self.opt.param_groups[0]['lr'], self.global_iter_count)
+
+                    # TODO, collect entropy of the model distribution
+                    dist_entropy = torch.mean(pred_dist.entropy())
+                    writer.add_scalar('train/dist_entropy',
+                                      dist_entropy, self.global_iter_count)
+                    writer.add_scalar('train/mean_kl',
+                                      mean_kl, self.global_iter_count)
+                    writer.add_scalar('train/mean_entropy',
+                                      mean_entropy, self.global_iter_count)
+
+                    # loss dictionary
+                    for k, v in average_torch_dicts(train_stats_all).items():
+                        # print(k, v, v.size())
+                        if v.ndim > 1:
+                            v = torch.mean(v)
+                        # print(k)
+                        writer.add_scalar(k, v, self.global_iter_count)
 
                 train_count += 1
 
@@ -1174,10 +1337,8 @@ class Trainer:
                         if fde_ind == sorted_index_final[0]:
                             num_match_fde += 1
                         if ade_ind in sorted_index:
-                            print(fde_ind, sorted_index, '--ade')
                             num_match_ade_5 += 1
                         if fde_ind in sorted_index_final:
-                            print(fde_ind, sorted_index, '--fde')
                             num_match_fde_5 += 1
 
 
@@ -1251,6 +1412,405 @@ class Trainer:
               np.round(diff_gt_pred_mean_ratio, 3))
         # print(num_rank/count)
 
+    def test_single_model_vis_rs_reward(self):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        all_scores = []
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+
+                sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
+                sample_prediction = torch.exp(variance_estimation / 2)[
+                                        ..., None, None] * sample_prediction / sample_prediction.std(dim=1).mean(
+                    dim=(1, 2))[:, None, None, None]
+                loc = sample_prediction + mean_estimation[:, None]
+
+                pred_traj = self.p_sample_loop_accelerate(past_traj, traj_mask, loc)
+                fut_traj_2 = fut_traj.unsqueeze(1)
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                # get diff-score
+                # if self.test_diff_score:
+                noise_gt_loss, score_gt = self.noise_estimation_loss_score_vis(past_traj, fut_traj, traj_mask)
+                noise_preds = []
+                score_preds = []
+                for ns in range(pred_traj.size(1)):
+                    noise_pred_loss_i, scores = self.noise_estimation_loss_score_vis(past_traj,
+                                                                                     pred_traj[:, ns, ...],
+                                                                                     traj_mask)
+                    noise_preds.append(noise_pred_loss_i.item())
+                    score_preds.append(scores.cpu().numpy())
+
+                # print(noise_gt_loss, noise_min_pred, '-----', noise_mean_pred)
+                noise_min_pred = np.argmin(noise_preds)
+                noise_median_pred = np.argsort(noise_preds)[len(noise_preds) // 2]
+                noise_max_pred = np.argmax(noise_preds)
+
+                score_min = score_preds[noise_min_pred]
+                score_median = score_preds[noise_median_pred]
+                score_mean = np.mean(np.stack(score_preds), 0)
+                score_gt = score_gt.cpu().numpy()
+                all_scores.append([score_gt, score_mean, score_median, score_min])
+
+                # print(noise_preds[noise_min_pred], noise_preds[noise_median_pred], np.mean(score_mean), noise_preds[noise_max_pred])
+
+        save_path = 'result_vis/%s.pkl' % (self.dset,)
+        import pickle as pkl
+        with open(save_path, 'wb') as f:
+            print('Write to %s' % (save_path,))
+            pkl.dump(all_scores, f)
+
+        import pickle as pkl
+        for dname in ['eth', 'univ', 'zara1', 'hotel', 'nba', 'robo']:
+            save_path = 'vis_paper/%s.pkl' % (dname,)
+            with open(save_path, 'rb') as f:
+                print('Read %s' % (save_path,))
+                all_scores = pkl.load(f)
+            print(all_scores)
+
+    def test_single_model_vis_trajectory(self, suffix):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        all_scores = []
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+
+                sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
+                sample_prediction = torch.exp(variance_estimation / 2)[
+                                        ..., None, None] * sample_prediction / sample_prediction.std(dim=1).mean(
+                    dim=(1, 2))[:, None, None, None]
+                loc = sample_prediction + mean_estimation[:, None]
+
+                pred_traj = self.p_sample_loop_accelerate(past_traj, traj_mask, loc)
+                fut_traj_2 = fut_traj.unsqueeze(1)
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                # get diff-score
+                # if self.test_diff_score:
+                noise_gt_loss, noise_gt_loss_f, score_gt = self.noise_estimation_loss_score_vis(past_traj, fut_traj, traj_mask)
+                noise_preds = []
+                score_preds = []
+                noise_preds_final = []
+
+                for ns in range(pred_traj.size(1)):
+                    noise_pred_loss_i, noise_pred_loss_f, scores = self.noise_estimation_loss_score_vis(past_traj,
+                                                                                     pred_traj[:, ns, ...],
+                                                                                     traj_mask)
+                    noise_preds.append(noise_pred_loss_i)
+                    score_preds.append(scores.cpu().numpy())
+                    noise_preds_final.append(noise_pred_loss_f)
+
+                # print(noise_gt_loss, noise_min_pred, '-----', noise_mean_pred)
+                noise_min_pred = np.argmin(noise_preds)
+                noise_median_pred = np.argsort(noise_preds)[len(noise_preds) // 2]
+                # noise_max_pred = np.argmax(noise_preds)
+
+                sorted_index = np.argsort(noise_preds)[:5]
+                # print([noise_preds[id] for id in sorted_index])  # should be in increasing
+                # assert noise_min_pred == sorted_index[0]
+                #
+                # score_min = score_preds[noise_min_pred]
+                # score_median = score_preds[noise_median_pred]
+                # score_mean = np.mean(np.stack(score_preds), 0)
+                # score_gt = score_gt.cpu().numpy()
+
+                init_pos = past_traj[:, -1:, :2]
+                past_traj_abs = past_traj[:,:,2:4] + init_pos
+                fut_traj += init_pos
+                past_traj_abs = past_traj_abs.cpu().numpy() # see data_preprocess
+                fut_traj = fut_traj.cpu().numpy()
+                # print(past_traj_abs[0,...])
+                # print(fut_traj[0,...])
+
+                # trs = [past_traj_abs, fut_traj, [noise_gt_loss, noise_gt_loss_f]]
+                trs = [past_traj_abs, fut_traj, noise_gt_loss, noise_gt_loss_f]
+                for tid in sorted_index:
+                    # print(pred_traj[:, tid, ...].size(),  init_pos.size())
+                    pred_future_traj = pred_traj[:, tid, ...] + init_pos
+                    pred_future_traj = pred_future_traj.cpu().numpy()
+                    # print(pred_future_traj[0,...],'---',noise_preds[tid])
+                    # print(past_traj.shape, fut_traj.shape, pred_future_traj.shape, noise_preds[tid], score_preds[tid].shape)
+                    # trs.append([noise_preds[tid], score_preds[tid], pred_future_traj])
+                    trs.append([noise_preds[tid], noise_preds_final[tid], pred_future_traj])
+                all_scores.append(trs)
+                #print(noise_preds[noise_min_pred], noise_preds[noise_median_pred], np.mean(score_mean))
+
+        folder = 'vis_paper/trs_%s' % (suffix,)
+        os.makedirs(folder, exist_ok=True)
+        save_path = '%s/%s.pkl' % (folder, self.dset)
+        import pickle as pkl
+        with open(save_path, 'wb') as f:
+            print('Write to %s' % (save_path,))
+            pkl.dump(all_scores, f)
+
+        # import pickle as pkl
+        # for dname in ['eth','univ','zara1','hotel','nba','robo']:
+        #     save_path = 'result_vis/%s.pkl' % (dname,)
+        #     with open(save_path, 'rb') as f:
+        #         print('Read %s' % (save_path,))
+        #         all_scores = pkl.load(f)
+        #     print(all_scores)
+
+    def test_single_model_vis_adf_trajectory(self, suffix):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        all_scores = []
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+
+                sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
+                sample_prediction = torch.exp(variance_estimation / 2)[
+                                        ..., None, None] * sample_prediction / sample_prediction.std(dim=1).mean(
+                    dim=(1, 2))[:, None, None, None]
+                loc = sample_prediction + mean_estimation[:, None]
+
+                pred_traj = self.p_sample_loop_accelerate(past_traj, traj_mask, loc)
+                fut_traj_2 = fut_traj.unsqueeze(1)
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                # get diff-score
+                # if self.test_diff_score:
+                noise_gt_loss, noise_gt_loss_f, score_gt = self.noise_estimation_loss_score_vis(past_traj, fut_traj, traj_mask)
+                noise_preds = []
+                score_preds = []
+                noise_preds_final = []
+
+                for ns in range(pred_traj.size(1)):
+                    noise_pred_loss_i, noise_pred_loss_f, scores = self.noise_estimation_loss_score_vis(past_traj,
+                                                                                     pred_traj[:, ns, ...],
+                                                                                     traj_mask)
+                    noise_preds.append(noise_pred_loss_i)
+                    score_preds.append(scores.cpu().numpy())
+                    noise_preds_final.append(noise_pred_loss_f)
+
+                # print(noise_gt_loss, noise_min_pred, '-----', noise_mean_pred)
+                noise_min_pred = np.argmin(noise_preds)
+                noise_median_pred = np.argsort(noise_preds)[len(noise_preds) // 2]
+                # noise_max_pred = np.argmax(noise_preds)
+
+                sorted_index = np.argsort(noise_preds)[:5]
+                # print([noise_preds[id] for id in sorted_index])  # should be in increasing
+                # assert noise_min_pred == sorted_index[0]
+                #
+                # score_min = score_preds[noise_min_pred]
+                # score_median = score_preds[noise_median_pred]
+                # score_mean = np.mean(np.stack(score_preds), 0)
+                # score_gt = score_gt.cpu().numpy()
+
+                init_pos = past_traj[:, -1:, :2]
+                past_traj_abs = past_traj[:,:,2:4] + init_pos
+                fut_traj += init_pos
+                past_traj_abs = past_traj_abs.cpu().numpy() # see data_preprocess
+                fut_traj = fut_traj.cpu().numpy()
+                # print(past_traj_abs[0,...])
+                # print(fut_traj[0,...])
+
+                # trs = [past_traj_abs, fut_traj, [noise_gt_loss, noise_gt_loss_f]]
+                trs = [past_traj_abs, fut_traj]
+                for tid in sorted_index:
+                    # print(pred_traj[:, tid, ...].size(),  init_pos.size())
+                    pred_future_traj = pred_traj[:, tid, ...] + init_pos
+                    pred_future_traj = pred_future_traj.cpu().numpy()
+                    # print(pred_future_traj[0,...],'---',noise_preds[tid])
+                    # print(past_traj.shape, fut_traj.shape, pred_future_traj.shape, noise_preds[tid], score_preds[tid].shape)
+                    # trs.append([noise_preds[tid], score_preds[tid], pred_future_traj])
+                    adf = 1 - noise_preds[tid] / (noise_gt_loss + 1e-8)
+                    fdf = 1 - noise_preds_final[tid] / (noise_gt_loss + 1e-8)
+                    # print(adf, fdf)
+                    trs.append([adf, pred_future_traj])
+                all_scores.append(trs)
+                #print(noise_preds[noise_min_pred], noise_preds[noise_median_pred], np.mean(score_mean))
+
+        folder = 'vis_paper/trs_%s' % (suffix,)
+        os.makedirs(folder, exist_ok=True)
+        save_path = '%s/%s.pkl' % (folder, self.dset)
+        import pickle as pkl
+        with open(save_path, 'wb') as f:
+            print('Write to %s' % (save_path,))
+            pkl.dump(all_scores, f)
+
+        # import pickle as pkl
+        # for dname in ['eth','univ','zara1','hotel','nba','robo']:
+        #     save_path = 'result_vis/%s.pkl' % (dname,)
+        #     with open(save_path, 'rb') as f:
+        #         print('Read %s' % (save_path,))
+        #         all_scores = pkl.load(f)
+        #     print(all_scores)
+
+    def test_single_model_vis_stepwise_trajectory(self, suffix):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        all_scores = []
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+
+                sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
+                sample_prediction = torch.exp(variance_estimation / 2)[
+                                        ..., None, None] * sample_prediction / sample_prediction.std(dim=1).mean(
+                    dim=(1, 2))[:, None, None, None]
+                loc = sample_prediction + mean_estimation[:, None]
+
+                pred_traj = self.p_sample_loop_accelerate(past_traj, traj_mask, loc)
+
+                # print(pred_traj.size(), loc.size(), '----should be the same')
+
+                noise_gt_traj, noise_preds_traj = self.get_score_vis_traj(past_traj, fut_traj, pred_traj, traj_mask)
+                # print(noise_gt_traj.size(), noise_preds_traj.size(), '----should be the same')
+                #exit()
+
+                fut_traj_2 = fut_traj.unsqueeze(1)
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                # get diff-score
+                # if self.test_diff_score:
+                noise_gt_loss, noise_gt_loss_f, score_gt = self.noise_estimation_loss_score_vis(past_traj, fut_traj, traj_mask)
+                noise_preds = []
+                score_preds = []
+                noise_preds_final = []
+
+                for ns in range(pred_traj.size(1)):
+                    noise_pred_loss_i, noise_pred_loss_f, scores = self.noise_estimation_loss_score_vis(past_traj,
+                                                                                     pred_traj[:, ns, ...],
+                                                                                     traj_mask)
+                    noise_preds.append(noise_pred_loss_i)
+                    score_preds.append(scores.cpu().numpy())
+                    noise_preds_final.append(noise_pred_loss_f)
+
+
+                sorted_index = np.argsort(noise_preds)[:5]
+
+                init_pos = past_traj[:, -1:, :2]
+                # print(init_pos.shape,'==')
+                past_traj_abs = past_traj[:,:,2:4] + init_pos
+                fut_traj += init_pos
+                past_traj_abs = past_traj_abs.cpu().numpy() # see data_preprocess
+                fut_traj = fut_traj.cpu().numpy()
+                # print(past_traj_abs[0,...])
+                # print(fut_traj[0,...])
+
+                # trs = [past_traj_abs, fut_traj, [noise_gt_loss, noise_gt_loss_f]]
+                trs = [past_traj_abs, fut_traj]
+                for ix, tid in enumerate(sorted_index):
+                    # print(pred_traj[:, tid, ...].size(),  init_pos.size())
+                    if ix == len(sorted_index)-1:
+                        # add init position
+                        pred_future_traj = loc[:, tid, ...] + init_pos
+                        pred_future_traj_noise = noise_gt_traj + init_pos
+                    else:
+                        pred_future_traj = pred_traj[:, tid, ...] + init_pos
+                        pred_future_traj_noise = noise_preds_traj[tid,...]+ init_pos
+                    pred_future_traj = pred_future_traj.cpu().numpy()
+                    pred_future_traj_noise = pred_future_traj_noise.cpu().numpy()
+                    # print(pred_future_traj[0,...],'---',noise_preds[tid])
+                    # print(past_traj.shape, fut_traj.shape, pred_future_traj.shape, noise_preds[tid], score_preds[tid].shape)
+                    # trs.append([noise_preds[tid], score_preds[tid], pred_future_traj])
+                    adf = 1 - noise_preds[tid] / (noise_gt_loss + 1e-8)
+                    fdf = 1 - noise_preds_final[tid] / (noise_gt_loss + 1e-8)
+                    # print(adf, fdf)
+                    trs.append([adf, pred_future_traj, pred_future_traj_noise])
+                all_scores.append(trs)
+                #print(noise_preds[noise_min_pred], noise_preds[noise_median_pred], np.mean(score_mean))
+
+        folder = 'vis_paper_init_loc/trs_%s' % (suffix,)
+        os.makedirs(folder, exist_ok=True)
+        save_path = '%s/%s.pkl' % (folder, self.dset)
+        import pickle as pkl
+        with open(save_path, 'wb') as f:
+            print('Write to %s' % (save_path,))
+            pkl.dump(all_scores, f)
+
+        # import pickle as pkl
+        # for dname in ['eth','univ','zara1','hotel','nba','robo']:
+        #     save_path = 'result_vis/%s.pkl' % (dname,)
+        #     with open(save_path, 'rb') as f:
+        #         print('Read %s' % (save_path,))
+        #         all_scores = pkl.load(f)
+        #     print(all_scores)
+
     def get_ppo_config(self):
         ppo_config = PPOConfig(
             # mini_batch_size=args.batch_size,
@@ -1272,3 +1832,545 @@ class Trainer:
 
         return ppo_config
 
+    def test_sgcn_single_model(self, model_path):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+        import sys
+        sys.path.append("..")
+        from model import TrajectoryModel
+        from tools.utils import get_ID
+        model = TrajectoryModel(number_asymmetric_conv_layer=7, embedding_dims=64, number_gcn_layers=1, dropout=0,
+                                obs_len=self.hist_len, pred_len=self.fut_len, n_tcn=5, out_dims=5).to(self.device)
+        model.load_state_dict(torch.load(model_path, map_location='cpu'), strict=False)
+        model.eval()
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        int_pol_rt_bigls = []
+        diff_pred_min_score = 0.0
+        diff_gt_score = 0.0
+        diff_gt_pred_ratio = 0.0
+        diff_gt_pred_mean_ratio = 0.0
+        diff_gt_pred_final_ratio = 0.0
+        num_match_ade, num_match_fde = 0, 0
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+                batch = [tensor.to(self.device) for tensor in data]
+                obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
+                    loss_mask, V_obs, V_tr = batch
+                N_obj = V_obs.size(2)
+                identity = get_ID(self.hist_len, N_obj, self.device)
+                V_pred = model(V_obs, identity, use_train=False)  # A_obs <8, #, #>
+
+                data_pre_motion_3D = obs_traj.permute([0, 1, 3, 2])
+                initial_pos = data_pre_motion_3D[:, :, -1:]
+                # tmp = fut_traj + initial_pos
+                # tmp2 = pred_traj_gt.permute(0, 1, 3, 2).contiguous()
+                # print(tmp.size(),tmp2.size())
+                # print(tmp[0,0,...],tmp2[0,0,...])
+                # print(fut_traj.size(),'---1')
+                # exit()
+
+                V_pred = V_pred.squeeze()
+                V_tr = V_tr.squeeze()
+                num_of_objs = obs_traj_rel.shape[1]
+                V_pred, V_tr = V_pred[:, :num_of_objs, :], V_tr[:, :num_of_objs, :]
+                #
+                # #For now I have my bi-variate parameters
+                # #normx =  V_pred[:,:,0:1]
+                # #normy =  V_pred[:,:,1:2]
+                sx = torch.exp(V_pred[:, :, 2])  # sx
+                sy = torch.exp(V_pred[:, :, 3])  # sy
+                corr = torch.tanh(V_pred[:, :, 4])  # corr
+                #
+                cov = torch.zeros(V_pred.shape[0], V_pred.shape[1], 2, 2).to(self.device)
+                cov[:, :, 0, 0] = sx * sx
+                cov[:, :, 0, 1] = corr * sx * sy
+                cov[:, :, 1, 0] = corr * sx * sy
+                cov[:, :, 1, 1] = sy * sy
+                mean = V_pred[:, :, 0:2]
+                mvnormal = torchdist.MultivariateNormal(mean, cov)
+
+                V_x = seq_to_nodes(obs_traj.data.cpu().numpy().copy())
+                # V_x_rel_to_abs = nodes_rel_to_nodes_abs(V_obs[:, :, :, :2].data.cpu().numpy().squeeze().copy(),
+                #                                         V_x[0, :, :].copy())
+                # V_y_rel_to_abs = nodes_rel_to_nodes_abs(V_tr.data.cpu().numpy().squeeze().copy(),
+                #                                         V_x[-1, :, :].copy())
+                # V_y_rel_to_abs_tensor = torch.from_numpy(V_y_rel_to_abs).to(self.device)
+                V_pred_all = []
+                for k in range(N_sample):
+                    V_pred = mvnormal.sample()
+                    # print(V_pred.size())
+                    V_pred_rel_to_abs = nodes_rel_to_nodes_abs(V_pred.data.cpu().numpy().squeeze().copy(),
+                                                               V_x[-1, :, :].copy())
+                    # print(V_pred_rel_to_abs.shape)
+                    V_pred_all.append(V_pred_rel_to_abs)
+
+                pred_traj = np.stack(V_pred_all)
+                # [20, 12, 2, 2]
+                pred_traj = torch.tensor(pred_traj).float().to(self.device)
+                pred_traj = pred_traj.permute([2, 0, 1, 3])
+                initial_pos_2 = initial_pos.permute([1, 0, 2, 3])
+                pred_traj -= initial_pos_2
+                # pred_traj = pred_traj + initial_pos_2
+                # print(pred_traj.size(), initial_pos.size())
+                # exit()
+                # print(pred_traj.size())
+                # exit()
+                # sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)
+                # sample_prediction = torch.exp(variance_estimation / 2)[
+                #                         ..., None, None] * sample_prediction / sample_prediction.std(dim=1).mean(
+                #     dim=(1, 2))[:, None, None, None]
+                # loc = sample_prediction + mean_estimation[:, None]
+                # pred_traj = self.p_sample_loop_accelerate(past_traj, traj_mask, loc)
+
+                fut_traj_2 = fut_traj.unsqueeze(1)
+
+                # V_y_rel_to_abs_tensor = V_y_rel_to_abs_tensor.permute([1,0,2])
+                # print(pred_traj.size(), V_y_rel_to_abs_tensor.size(),'--',fut_traj_2.size(),initial_pos_2.size())
+                # fut_traj_3 = fut_traj_2 + initial_pos_2
+                # print(V_y_rel_to_abs_tensor[0,...], fut_traj_3[0,0,...])
+                # V_y_rel_to_abs_tensor = V_y_rel_to_abs_tensor.unsqueeze(1)
+                # exit()
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                # distances2 = torch.norm(pred_traj - V_y_rel_to_abs_tensor, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                # get diff-score
+                if True:
+                    noise_gt_loss, noise_gt_loss_f = self.noise_estimation_loss_score(past_traj, fut_traj, traj_mask)
+                    # assert pred_traj.size(1)==20
+                    # print(past_traj.size(), fut_traj.size(), pred_traj.size())
+                    noise_preds = []
+                    noise_preds_final = []
+                    for ns in range(pred_traj.size(1)):
+                        noise_pred_loss_i, noise_pred_loss_f = self.noise_estimation_loss_score(past_traj,
+                                                                                                pred_traj[:, ns, ...],
+                                                                                                traj_mask)
+                        noise_preds.append(noise_pred_loss_i)
+                        noise_preds_final.append(noise_pred_loss_f)
+
+                    noise_min_pred = min(noise_preds)
+                    noise_mean_pred = np.mean(noise_preds)
+                    noise_min_final_pred = min(noise_preds_final)
+                    diff_pred_min_score += noise_min_pred
+                    diff_gt_score += noise_gt_loss
+
+                    if 1 == 1:
+                        ade_ind = (distances[:, :, :]).mean(dim=-1).mean(0).min(dim=0)[1]
+                        fde_ind = (distances[:, :, -1]).mean(dim=0).min(dim=0)[1]
+                        noise_ind = np.argmin(noise_preds)
+                        # noise_fde_min_pred = noise_preds[fde_ind.item()]
+                        # print(noise_fde_min_pred, noise_gt_loss)
+                        if fde_ind.item() == noise_ind:
+                            num_match_fde += 1
+                        if ade_ind.item() == noise_ind:
+                            num_match_ade += 1
+                        diff_gt_pred_ratio += 1 - noise_min_pred / (noise_gt_loss + 1e-8)
+                        diff_gt_pred_mean_ratio += 1 - noise_mean_pred / (noise_gt_loss + 1e-8)
+                        diff_gt_pred_final_ratio += 1 - noise_min_final_pred / (noise_gt_loss + 1e-8)
+
+                # get ip-score
+                if True:
+                    int_pol_rt_ls = []
+                    # [12, N, 2=xy]
+                    V_x = seq_to_nodes(obs_traj.data.cpu().numpy().copy())
+                    V_y_rel_to_abs = nodes_rel_to_nodes_abs(V_tr.data.cpu().numpy().squeeze().copy(),
+                                                            V_x[-1, :, :].copy())
+                    V_y_rel_to_abs_tensor = torch.from_numpy(V_y_rel_to_abs).to(obs_traj.device)
+
+                    pred_xy = pred_traj.permute(1, 2, 0, 3).data.cpu().numpy().squeeze().copy()
+                    V_pred_rel_to_abs = self.nodes_sample_rel_to_nodes_abs(pred_xy, V_x[-1, :, :].copy())
+
+                    # tt = pred_traj + initial_pos_2
+                    # tt = tt.permute(1, 2, 0, 3).data.cpu().numpy().squeeze().copy()
+                    # print(V_pred_rel_to_abs.shape, tt.shape)
+                    # print(V_pred_rel_to_abs[0, 0:2, ...])
+                    # print(tt[0, 0:2, ...])
+                    #
+                    # print()
+                    # print(V_x[-1, :2, :], initial_pos_2)
+                    # exit()
+
+                    V_pred_rel_to_abs_tensor = torch.from_numpy(V_pred_rel_to_abs).to(obs_traj.device)
+                    V_gt_abs_diff = V_y_rel_to_abs_tensor.unsqueeze(2) - V_y_rel_to_abs_tensor.unsqueeze(1)
+
+                    # true_pair_dist = torch.mean(torch.sqrt(torch.sum(V_gt_abs_diff ** 2, dim=-1)), 0)
+                    # print(true_pair_dist.size())
+                    # true_pair_dist = true_pair_dist[0, :]
+                    # print(true_pair_dist)
+
+                    V_pred_abs_diff_all = V_pred_rel_to_abs_tensor.unsqueeze(
+                        2 + 1) - V_pred_rel_to_abs_tensor.unsqueeze(1 + 1)
+                    # print(V_pred_rel_to_abs_tensor.size())
+                    for n_sample in range(V_pred_rel_to_abs_tensor.size(0)):
+                        # [12, N, N, 2]
+                        V_pred_abs_diff = V_pred_abs_diff_all[n_sample, ...]
+                        intimacy_score, politeness_score = intimacy_politeness_score(V_pred_abs_diff, V_gt_abs_diff,
+                                                                                     self.social_dist_sigma,
+                                                                                     hinge_ratio=0.25)
+                        # print(intimacy_score, politeness_score)
+                        # int_pol_rt_ls.append(0.5 * (intimacy_score + politeness_score))
+                        score_n = 0
+                        score_sum = 0
+                        if intimacy_score > 0:
+                            score_sum += intimacy_score
+                            score_n += 1
+                        if politeness_score > 0:
+                            score_sum += politeness_score
+                            score_n += 1
+                        if score_n > 0:
+                            score_sum /= score_n
+                        int_pol_rt_ls.append(score_sum)
+
+                    int_pol_rt_bigls.append(max(int_pol_rt_ls))
+
+                samples += distances.shape[0]
+                count += 1
+            # if count==2:
+            # 	break
+
+        ade_all, fde_all = performance['ADE'] / samples, performance['FDE'] / samples
+        ipscore = sum(int_pol_rt_bigls) / len(int_pol_rt_bigls)
+        diff_gt_score /= count
+        diff_pred_min_score /= count
+        diffscore = 1 - diff_pred_min_score / (diff_gt_score + 1e-8)
+
+        diff_gt_pred_ratio /= count
+        diff_gt_pred_mean_ratio /= count
+        diff_gt_pred_final_ratio /= count
+
+        print('Test %s, ADE: %.4f, FDE: %.4f, IP: %.4f, DS: %.3f %.3f %.3f, Match %.3f/%.3f' % (
+            self.dset, ade_all, fde_all, ipscore, diff_gt_pred_ratio, diff_gt_pred_final_ratio, diff_gt_pred_mean_ratio,
+            num_match_ade / count, num_match_fde / count))
+        print(np.round(ade_all, 3), " ", np.round(fde_all, 3), " ",
+              np.round(ipscore, 3), " ",
+              np.round(diff_gt_pred_ratio, 3), " ",
+              np.round(diff_gt_pred_final_ratio, 3), " ",
+              np.round(diff_gt_pred_mean_ratio, 3))
+
+
+    def test_sgcn_single_model_vis_trajectory(self, model_path, suffix):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+        import sys
+        sys.path.append("..")
+        from model import TrajectoryModel
+        from tools.utils import get_ID
+        model = TrajectoryModel(number_asymmetric_conv_layer=7, embedding_dims=64, number_gcn_layers=1, dropout=0,
+                                obs_len=self.hist_len, pred_len=self.fut_len, n_tcn=5, out_dims=5).to(self.device)
+        model.load_state_dict(torch.load(model_path, map_location='cpu'), strict=False)
+        model.eval()
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        int_pol_rt_bigls = []
+        diff_pred_min_score = 0.0
+        diff_gt_score = 0.0
+        diff_gt_pred_ratio = 0.0
+        diff_gt_pred_mean_ratio = 0.0
+        diff_gt_pred_final_ratio = 0.0
+        num_match_ade, num_match_fde = 0, 0
+        all_scores = []
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+                batch = [tensor.to(self.device) for tensor in data]
+                obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
+                    loss_mask, V_obs, V_tr = batch
+                N_obj = V_obs.size(2)
+                identity = get_ID(self.hist_len, N_obj, self.device)
+                V_pred = model(V_obs, identity, use_train=False)  # A_obs <8, #, #>
+
+                data_pre_motion_3D = obs_traj.permute([0, 1, 3, 2])
+                initial_pos = data_pre_motion_3D[:, :, -1:]
+                # tmp = fut_traj + initial_pos
+                # tmp2 = pred_traj_gt.permute(0, 1, 3, 2).contiguous()
+                # print(tmp.size(),tmp2.size())
+                # print(tmp[0,0,...],tmp2[0,0,...])
+                # print(fut_traj.size(),'---1')
+                # exit()
+
+                V_pred = V_pred.squeeze()
+                V_tr = V_tr.squeeze()
+                num_of_objs = obs_traj_rel.shape[1]
+                V_pred, V_tr = V_pred[:, :num_of_objs, :], V_tr[:, :num_of_objs, :]
+                #
+                # #For now I have my bi-variate parameters
+                # #normx =  V_pred[:,:,0:1]
+                # #normy =  V_pred[:,:,1:2]
+                sx = torch.exp(V_pred[:, :, 2])  # sx
+                sy = torch.exp(V_pred[:, :, 3])  # sy
+                corr = torch.tanh(V_pred[:, :, 4])  # corr
+                #
+                cov = torch.zeros(V_pred.shape[0], V_pred.shape[1], 2, 2).to(self.device)
+                cov[:, :, 0, 0] = sx * sx
+                cov[:, :, 0, 1] = corr * sx * sy
+                cov[:, :, 1, 0] = corr * sx * sy
+                cov[:, :, 1, 1] = sy * sy
+                mean = V_pred[:, :, 0:2]
+                mvnormal = torchdist.MultivariateNormal(mean, cov)
+
+                V_x = seq_to_nodes(obs_traj.data.cpu().numpy().copy())
+                # V_x_rel_to_abs = nodes_rel_to_nodes_abs(V_obs[:, :, :, :2].data.cpu().numpy().squeeze().copy(),
+                #                                         V_x[0, :, :].copy())
+                # V_y_rel_to_abs = nodes_rel_to_nodes_abs(V_tr.data.cpu().numpy().squeeze().copy(),
+                #                                         V_x[-1, :, :].copy())
+                # V_y_rel_to_abs_tensor = torch.from_numpy(V_y_rel_to_abs).to(self.device)
+                V_pred_all = []
+                for k in range(N_sample):
+                    V_pred = mvnormal.sample()
+                    # print(V_pred.size())
+                    V_pred_rel_to_abs = nodes_rel_to_nodes_abs(V_pred.data.cpu().numpy().squeeze().copy(),
+                                                               V_x[-1, :, :].copy())
+                    # print(V_pred_rel_to_abs.shape)
+                    V_pred_all.append(V_pred_rel_to_abs)
+
+                pred_traj = np.stack(V_pred_all)
+                # [20, 12, 2, 2]
+                pred_traj = torch.tensor(pred_traj).float().to(self.device)
+                pred_traj = pred_traj.permute([2, 0, 1, 3])
+                initial_pos_2 = initial_pos.permute([1, 0, 2, 3])
+                pred_traj -= initial_pos_2
+                fut_traj_2 = fut_traj.unsqueeze(1)
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                if True:
+                    noise_gt_loss, score_gt = self.noise_estimation_loss_score_vis(past_traj, fut_traj, traj_mask)
+                    # assert pred_traj.size(1)==20
+                    # print(past_traj.size(), fut_traj.size(), pred_traj.size())
+                    noise_preds = []
+                    score_preds = []
+                    for ns in range(pred_traj.size(1)):
+                        noise_pred_loss_i, scores = self.noise_estimation_loss_score_vis(past_traj,
+                                                                                                pred_traj[:, ns, ...],
+                                                                                                traj_mask)
+                        noise_preds.append(noise_pred_loss_i.item())
+                        score_preds.append(scores.cpu().numpy())
+
+                    # noise_min_pred = min(noise_preds)
+                    # noise_mean_pred = np.mean(noise_preds)
+                    # noise_min_final_pred = min(noise_preds_final)
+                    # diff_pred_min_score += noise_min_pred
+                    # diff_gt_score += noise_gt_loss
+                    sorted_index = np.argsort(noise_preds)[:5]
+
+                    init_pos = past_traj[:, -1:, :2]
+                    # print(init_pos[0,0,:])
+                    # print(initial_pos_2[0,0,0,:])
+                    # exit()
+                    past_traj_abs = past_traj[:, :, 2:4] + init_pos
+                    fut_traj += init_pos
+                    past_traj_abs = past_traj_abs.cpu().numpy()  # see data_preprocess
+                    fut_traj = fut_traj.cpu().numpy()
+
+                    trs = [past_traj_abs, fut_traj]
+                    for tid in sorted_index:
+                        # print(pred_traj[:, tid, ...].size(),  init_pos.size())
+                        pred_future_traj = pred_traj[:, tid, ...] + init_pos
+                        pred_future_traj = pred_future_traj.cpu().numpy()
+                        # print(pred_future_traj[0,...],'---',noise_preds[tid])
+                        # print(past_traj.shape, fut_traj.shape, pred_future_traj.shape, noise_preds[tid], score_preds[tid].shape)
+                        trs.append([noise_preds[tid], score_preds[tid], pred_future_traj])
+                    all_scores.append(trs)
+
+
+
+                samples += distances.shape[0]
+                count += 1
+            # if count==2:
+            # 	break
+
+        folder = 'vis_paper/trs_%s' % (suffix,)
+        os.makedirs(folder, exist_ok=True)
+        save_path = '%s/%s.pkl' % (folder, self.dset)
+        import pickle as pkl
+        with open(save_path, 'wb') as f:
+            print('Write to %s' % (save_path,))
+            pkl.dump(all_scores, f)
+
+    def test_sgcn_single_model_vis_adf_trajectory(self, model_path, suffix):
+
+        performance = {'FDE': 0.0, 'ADE': 0.0}
+        samples = 0
+        import sys
+        sys.path.append("..")
+        from model import TrajectoryModel
+        from tools.utils import get_ID
+        model = TrajectoryModel(number_asymmetric_conv_layer=7, embedding_dims=64, number_gcn_layers=1, dropout=0,
+                                obs_len=self.hist_len, pred_len=self.fut_len, n_tcn=5, out_dims=5).to(self.device)
+        model.load_state_dict(torch.load(model_path, map_location='cpu'), strict=False)
+        model.eval()
+
+        def prepare_seed(rand_seed):
+            np.random.seed(rand_seed)
+            random.seed(rand_seed)
+            torch.manual_seed(rand_seed)
+            torch.cuda.manual_seed_all(rand_seed)
+
+        prepare_seed(0)
+        count = 0
+        N_sample = 20
+        all_scores = []
+
+        with torch.no_grad():
+            for ix, data in enumerate(self.test_loader):
+                if ix % 100 == 0:
+                    print('%d/%d' % (ix, len(self.test_loader)))
+                batch_size, traj_mask, past_traj, fut_traj, obs_traj, V_tr = self.data_preprocess(data,
+                                                                                                  use_rl_data=True)
+                batch = [tensor.to(self.device) for tensor in data]
+                obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
+                    loss_mask, V_obs, V_tr = batch
+                N_obj = V_obs.size(2)
+                identity = get_ID(self.hist_len, N_obj, self.device)
+                V_pred = model(V_obs, identity, use_train=False)  # A_obs <8, #, #>
+
+                data_pre_motion_3D = obs_traj.permute([0, 1, 3, 2])
+                initial_pos = data_pre_motion_3D[:, :, -1:]
+                # tmp = fut_traj + initial_pos
+                # tmp2 = pred_traj_gt.permute(0, 1, 3, 2).contiguous()
+                # print(tmp.size(),tmp2.size())
+                # print(tmp[0,0,...],tmp2[0,0,...])
+                # print(fut_traj.size(),'---1')
+                # exit()
+
+                V_pred = V_pred.squeeze()
+                V_tr = V_tr.squeeze()
+                num_of_objs = obs_traj_rel.shape[1]
+                V_pred, V_tr = V_pred[:, :num_of_objs, :], V_tr[:, :num_of_objs, :]
+                #
+                # #For now I have my bi-variate parameters
+                # #normx =  V_pred[:,:,0:1]
+                # #normy =  V_pred[:,:,1:2]
+                sx = torch.exp(V_pred[:, :, 2])  # sx
+                sy = torch.exp(V_pred[:, :, 3])  # sy
+                corr = torch.tanh(V_pred[:, :, 4])  # corr
+                #
+                cov = torch.zeros(V_pred.shape[0], V_pred.shape[1], 2, 2).to(self.device)
+                cov[:, :, 0, 0] = sx * sx
+                cov[:, :, 0, 1] = corr * sx * sy
+                cov[:, :, 1, 0] = corr * sx * sy
+                cov[:, :, 1, 1] = sy * sy
+                mean = V_pred[:, :, 0:2]
+                mvnormal = torchdist.MultivariateNormal(mean, cov)
+
+                V_x = seq_to_nodes(obs_traj.data.cpu().numpy().copy())
+                # V_x_rel_to_abs = nodes_rel_to_nodes_abs(V_obs[:, :, :, :2].data.cpu().numpy().squeeze().copy(),
+                #                                         V_x[0, :, :].copy())
+                # V_y_rel_to_abs = nodes_rel_to_nodes_abs(V_tr.data.cpu().numpy().squeeze().copy(),
+                #                                         V_x[-1, :, :].copy())
+                # V_y_rel_to_abs_tensor = torch.from_numpy(V_y_rel_to_abs).to(self.device)
+                V_pred_all = []
+                for k in range(N_sample):
+                    V_pred = mvnormal.sample()
+                    # print(V_pred.size())
+                    V_pred_rel_to_abs = nodes_rel_to_nodes_abs(V_pred.data.cpu().numpy().squeeze().copy(),
+                                                               V_x[-1, :, :].copy())
+                    # print(V_pred_rel_to_abs.shape)
+                    V_pred_all.append(V_pred_rel_to_abs)
+
+                pred_traj = np.stack(V_pred_all)
+                # [20, 12, 2, 2]
+                pred_traj = torch.tensor(pred_traj).float().to(self.device)
+                pred_traj = pred_traj.permute([2, 0, 1, 3])
+                initial_pos_2 = initial_pos.permute([1, 0, 2, 3])
+                pred_traj -= initial_pos_2
+                fut_traj_2 = fut_traj.unsqueeze(1)
+                distances = torch.norm(fut_traj_2 - pred_traj, dim=-1) * self.traj_scale
+
+                ade = (distances[:, :, :]).mean(dim=-1).min(dim=-1)[0].sum()
+                fde = (distances[:, :, -1]).min(dim=-1)[0].sum()
+                performance['ADE'] += ade.item()
+                performance['FDE'] += fde.item()
+
+                if True:
+                    noise_gt_loss, noise_gt_loss_f, score_gt = self.noise_estimation_loss_score_vis(past_traj, fut_traj, traj_mask)
+                    # assert pred_traj.size(1)==20
+                    # print(past_traj.size(), fut_traj.size(), pred_traj.size())
+                    noise_preds = []
+                    score_preds = []
+                    noise_preds_final = []
+                    for ns in range(pred_traj.size(1)):
+                        noise_pred_loss_i, noise_pred_loss_f, scores = self.noise_estimation_loss_score_vis(past_traj,
+                                                                                         pred_traj[:, ns, ...],
+                                                                                         traj_mask)
+                        noise_preds.append(noise_pred_loss_i)
+                        score_preds.append(scores.cpu().numpy())
+                        noise_preds_final.append(noise_pred_loss_f)
+
+                    # noise_min_pred = min(noise_preds)
+                    # noise_mean_pred = np.mean(noise_preds)
+                    # noise_min_final_pred = min(noise_preds_final)
+                    # diff_pred_min_score += noise_min_pred
+                    # diff_gt_score += noise_gt_loss
+                    sorted_index = np.argsort(noise_preds)[:5]
+
+                    init_pos = past_traj[:, -1:, :2]
+                    # print(init_pos[0,0,:])
+                    # print(initial_pos_2[0,0,0,:])
+                    # exit()
+                    past_traj_abs = past_traj[:, :, 2:4] + init_pos
+                    fut_traj += init_pos
+                    past_traj_abs = past_traj_abs.cpu().numpy()  # see data_preprocess
+                    fut_traj = fut_traj.cpu().numpy()
+
+                    trs = [past_traj_abs, fut_traj]
+                    for tid in sorted_index:
+                        # print(pred_traj[:, tid, ...].size(),  init_pos.size())
+                        pred_future_traj = pred_traj[:, tid, ...] + init_pos
+                        pred_future_traj = pred_future_traj.cpu().numpy()
+                        adf = 1 - noise_preds[tid] / (noise_gt_loss + 1e-8)
+                        fdf = 1 - noise_preds_final[tid] / (noise_gt_loss + 1e-8)
+                        # print(pred_future_traj[0,...],'---',noise_preds[tid])
+                        # print(past_traj.shape, fut_traj.shape, pred_future_traj.shape, noise_preds[tid], score_preds[tid].shape)
+                        trs.append([adf, pred_future_traj])
+                    all_scores.append(trs)
+
+                samples += distances.shape[0]
+                count += 1
+            # if count==2:
+            # 	break
+
+        folder = 'vis_paper/trs_%s' % (suffix,)
+        os.makedirs(folder, exist_ok=True)
+        save_path = '%s/%s.pkl' % (folder, self.dset)
+        import pickle as pkl
+        with open(save_path, 'wb') as f:
+            print('Write to %s' % (save_path,))
+            pkl.dump(all_scores, f)

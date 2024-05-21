@@ -26,8 +26,8 @@ OK/*
 examples/*
 output/*
 
-dataset_processed/*
-model_save/*
+dataset_processed_2/*
+model_save_2/*
 
 msvd-qa/data/msvd_qa/*.h5
 msvd-qa/saved_models

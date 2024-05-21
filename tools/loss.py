@@ -90,18 +90,6 @@ class l2loss_new:
         return regularization_loss
 
 
-# class l2loss:
-#     def __init__(self):
-#         pass
-#
-#     def __call__(self, model):
-#         regularization_loss = 0
-#
-#         for name, param in model.named_parameters():
-#             regularization_loss += torch.sum(param ** 2)
-#
-#         return regularization_loss
-
 class FocalLoss(torch.nn.Module):
 
     def __init__(self, weight=None, gamma=2., reduction='mean'):
